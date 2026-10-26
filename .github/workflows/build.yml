@@ -1,0 +1,207 @@
+name: Build RPMs
+
+on:
+  push:
+    branches: ['main']
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  build:
+    name: Build (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: amd64, runner: ubuntu-24.04, rpmarch: x86_64 }
+          - { arch: arm64, runner: ubuntu-24.04-arm, rpmarch: aarch64 }
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Build RPMs (export stage)
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          target: export
+          platforms: linux/${{ matrix.arch }}
+          outputs: type=local,dest=out
+          cache-from: type=gha,scope=${{ matrix.arch }}
+          cache-to: type=gha,scope=${{ matrix.arch }},mode=max
+          push: false
+
+      - name: List and verify RPMs
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Ship the (arch-independent) SRPM only once, from amd64.
+          if [ "${{ matrix.arch }}" != "amd64" ]; then rm -rf out/SRPMS; fi
+          ls -lR out
+          if ! ls out/RPMS/${{ matrix.rpmarch }}/*.rpm >/dev/null 2>&1; then
+            echo "::error::No ${{ matrix.rpmarch }} RPMs were produced"
+            exit 1
+          fi
+          docker run --rm -v "$PWD/out:/out:ro" rockylinux/rockylinux:9-minimal \
+            sh -euc 'for f in /out/RPMS/*/*.rpm /out/SRPMS/*.rpm; do
+              [ -e "$f" ] || continue
+              rpm -K --nosignature "$f"
+              rpm -qp --qf "%{NAME}-%{VERSION}-%{RELEASE}.%{ARCH}\n" "$f"
+            done'
+
+      - name: Smoke test (install + run in rockylinux:9)
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run --rm -v "$PWD/out:/out:ro" rockylinux/rockylinux:9 bash -euo pipefail -c '
+            mapfile -t rpms < <(ls /out/RPMS/*/*.rpm | grep -v -e debuginfo -e debugsource)
+            printf "Installing: %s\n" "${rpms[@]}"
+            dnf -y -q install "${rpms[@]}"
+            rpm -q brotli libbrotli
+            brotli --version
+            cd "$(mktemp -d)"
+            head -c 1M /dev/urandom > f
+            brotli -k f && brotli -d -o g f.br && cmp f g
+            if rpm -q python3-brotli >/dev/null 2>&1; then
+              python3 -c "import brotli; assert brotli.decompress(brotli.compress(b\"x\")) == b\"x\""
+            fi
+            echo "Smoke test passed"'
+
+      - name: rpmlint (informational)
+        continue-on-error: true
+        shell: bash
+        run: |
+          docker run --rm -v "$PWD/out:/out:ro" rockylinux/rockylinux:9 bash -euc '
+            dnf -y -q install epel-release && dnf -y -q install rpmlint
+            rpmlint /out/RPMS/*/*.rpm $(ls /out/SRPMS/*.rpm 2>/dev/null || true)'
+
+      - name: Upload RPMs
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: rpms-${{ matrix.arch }}
+          path: out/**/*.rpm
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub Release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+      artifact-metadata: write
+    env:
+      # `secrets` cannot be used in step `if:`; expose only a boolean here.
+      HAVE_RPM_GPG_KEY: ${{ secrets.RPM_GPG_PRIVATE_KEY != '' }}
+    steps:
+      - name: Download RPM artifacts
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: rpms-*
+          path: artifacts
+          merge-multiple: true
+
+      - name: Flatten RPMs into dist/
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          # Binary RPMs: basenames are unique per arch.
+          find artifacts -type f -name '*.rpm' ! -name '*.src.rpm' -exec cp -f {} dist/ \;
+          # SRPM: keep exactly one copy per basename, even if several arches shipped it.
+          find artifacts -type f -name '*.src.rpm' -print0 | sort -z |
+            while IFS= read -r -d '' f; do
+              [ -e "dist/$(basename "$f")" ] || cp "$f" dist/
+            done
+          ls dist/*.rpm >/dev/null
+          ls -l dist
+
+      - name: Sign RPMs (optional, needs RPM_GPG_PRIVATE_KEY)
+        if: env.HAVE_RPM_GPG_KEY == 'true'
+        shell: bash
+        env:
+          RPM_GPG_PRIVATE_KEY: ${{ secrets.RPM_GPG_PRIVATE_KEY }}
+          RPM_GPG_PASSPHRASE: ${{ secrets.RPM_GPG_PASSPHRASE }}
+        run: |
+          set -euo pipefail
+          docker run --rm -v "$PWD/dist:/dist" -e RPM_GPG_PRIVATE_KEY -e RPM_GPG_PASSPHRASE \
+            -e HOST_ID="$(id -u):$(id -g)" rockylinux/rockylinux:9 bash -euo pipefail -c '
+            dnf -y -q install rpm-sign gnupg2
+            export GNUPGHOME="$(mktemp -d)"
+            printf "%s\n" "$RPM_GPG_PRIVATE_KEY" | gpg --batch --import
+            fpr=$(gpg --batch --with-colons --list-secret-keys | awk -F: "/^fpr:/{print \$10; exit}")
+            printf "%s" "${RPM_GPG_PASSPHRASE:-}" > "$GNUPGHOME/pp"
+            cat > ~/.rpmmacros <<EOF
+          %_gpg_name $fpr
+          %_gpg_sign_cmd_extra_args --batch --pinentry-mode loopback --passphrase-file $GNUPGHOME/pp
+          EOF
+            rpmsign --addsign /dist/*.rpm
+            gpg --batch --armor --export "$fpr" > /dist/RPM-GPG-KEY-brotli
+            rpm --import /dist/RPM-GPG-KEY-brotli
+            rpm -K /dist/*.rpm
+            chown "$HOST_ID" /dist/*'
+
+      - name: Generate SBOM (SPDX JSON)
+        uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
+        with:
+          path: dist
+          format: spdx-json
+          output-file: dist/brotli-${{ github.ref_name }}.spdx.json
+          upload-artifact: true
+          upload-release-assets: false
+
+      - name: Generate SHA256SUMS
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd dist
+          files=(./*.rpm ./*.spdx.json)
+          [ -f RPM-GPG-KEY-brotli ] && files+=(./RPM-GPG-KEY-brotli)
+          sha256sum "${files[@]#./}" > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Attest build provenance
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: dist/*.rpm
+
+      - name: Attest SBOM
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: dist/*.rpm
+          sbom-path: dist/brotli-${{ github.ref_name }}.spdx.json
+
+      - name: Create or update release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          cd dist
+          assets=(*.rpm *.spdx.json SHA256SUMS)
+          [ -f RPM-GPG-KEY-brotli ] && assets+=(RPM-GPG-KEY-brotli)
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" "${assets[@]}" --clobber
+          else
+            notes="Verify provenance: \`gh attestation verify <file>.rpm -R ${GH_REPO}\`"
+            gh release create "$GITHUB_REF_NAME" --generate-notes \
+              --title "$GITHUB_REF_NAME" --notes "$notes" "${assets[@]}"
+          fi

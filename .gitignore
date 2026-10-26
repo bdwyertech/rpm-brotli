@@ -1,0 +1,9 @@
+# Local corporate CA (copied by `task copy-ca`; never commit)
+cacert.pem
+
+# Build outputs
+rpms/
+out/
+
+# Local build logs
+log.out
