@@ -1,5 +1,5 @@
 # syntax=docker/dockerfile:1
-FROM rockylinux/rockylinux:9-minimal AS builder
+FROM rockylinux/rockylinux:10-minimal AS builder
 
 # Optional corporate CA (local builds only): pass with
 #   --secret id=cacert,src=cacert.pem
